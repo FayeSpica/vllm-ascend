@@ -1,0 +1,166 @@
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
+#
+
+# Manually triggered job to build and push the A2 (Dockerfile) and A3
+# (Dockerfile.a3) images against a specific vLLM tag/commit. The VLLM_TAG
+# build-arg defaults to v0.23.0 and can be overridden at dispatch time.
+#
+# Each image is built natively on per-arch runners (amd64 + arm64), pushed by
+# digest, then merged into a single multi-arch manifest. Images are pushed to
+# quay.io/fayeomni/vllm-ascend with tags shaped as
+# <vllm_tag/commit>-<vllm_ascend_tag/commit>[ -<suffix> ], e.g.
+#   v0.23.0-v0.10.0       (A2, multi-arch)
+#   v0.23.0-v0.10.0-a3    (A3, multi-arch)
+name: Manual image build (VLLM_TAG)
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_tag:
+        description: 'vLLM tag/commit to build against (VLLM_TAG build-arg)'
+        required: true
+        type: string
+        default: 'v0.23.0'
+
+permissions:
+  contents: read
+
+env:
+  QUAY_REPO: quay.io/fayeomni/vllm-ascend
+
+jobs:
+  build-push-digest:
+    name: Build ${{ matrix.build_meta.name }} (${{ matrix.arch.tag }})
+    runs-on: ${{ matrix.arch.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build_meta:
+          - name: A2 Ubuntu
+            dockerfile: Dockerfile
+            key: a2
+          - name: A3 Ubuntu
+            dockerfile: Dockerfile.a3
+            key: a3
+        arch:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            tag: amd64
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+            tag: arm64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          docker-images: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Quay
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ vars.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.build_meta.dockerfile }}
+          platforms: ${{ matrix.arch.platform }}
+          push: true
+          provenance: false
+          outputs: type=image,name=${{ env.QUAY_REPO }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VLLM_TAG=${{ inputs.vllm_tag }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.build_meta.key }}-${{ matrix.arch.tag }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-image:
+    name: Merge ${{ matrix.build_meta.name }} multi-arch image
+    runs-on: ubuntu-latest
+    needs: build-push-digest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_meta:
+          - name: A2 Ubuntu
+            key: a2
+            suffix: ''
+          - name: A3 Ubuntu
+            key: a3
+            suffix: '-a3'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve vllm-ascend ref (tag or short commit)
+        id: ascend_ref
+        run: |
+          # Prefer an exact tag pointing at HEAD, otherwise fall back to the
+          # short commit SHA.
+          REF=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)
+          echo "value=${REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.build_meta.key }}-*
+          merge-multiple: true
+
+      - name: Login to Quay
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ vars.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Merge and push multi-arch image
+        env:
+          TAG: ${{ env.QUAY_REPO }}:${{ inputs.vllm_tag }}-${{ steps.ascend_ref.outputs.value }}${{ matrix.build_meta.suffix }}
+        run: |
+          DIGESTS=$(printf "${{ env.QUAY_REPO }}@sha256:%s " $(ls "${{ runner.temp }}/digests"))
+          echo "Merging digests into ${TAG}:"
+          echo "  ${DIGESTS}"
+          docker buildx imagetools create -t "${TAG}" ${DIGESTS}
+          docker buildx imagetools inspect "${TAG}"
